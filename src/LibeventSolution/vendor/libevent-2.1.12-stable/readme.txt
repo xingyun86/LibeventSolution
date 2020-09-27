@@ -1,0 +1,1 @@
+下载libevent-2.1.12-stable-cmake.zip，解压到当前文件夹
