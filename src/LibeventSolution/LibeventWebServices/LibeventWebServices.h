@@ -116,7 +116,18 @@ struct options {
 	const char* unixsock;
 	const char* docroot;
 };
-
+/* Make etag header flag*/
+static void make_etag_header(char * etag, size_t etag_size, int64_t st_mtime, int64_t st_size)
+{
+	snprintf(etag, etag_size, "\"%lx.%lld\"", (unsigned long)st_mtime, st_size);
+}
+static bool check_modified()
+{
+}
+/* Convert time to gmt time string */
+static void gmt_time_string(char* buf, size_t buf_len, time_t* t) {
+	strftime(buf, buf_len, "%a, %d %b %Y %H:%M:%S GMT", gmtime(t));
+}
 /* Try to guess a good content-type for 'path' */
 static const char*
 guess_content_type(const char* path)
@@ -199,6 +210,9 @@ send_document_cb(struct evhttp_request* req, void* arg)
 	size_t len;
 	int fd = -1;
 	struct stat st;
+	int code = HTTP_OK;
+	struct evkeyvalq* headers;
+	struct evkeyval* header;
 
 	if (evhttp_request_get_command(req) != EVHTTP_REQ_GET) {
 		dump_request_cb(req, arg);
@@ -319,26 +333,56 @@ send_document_cb(struct evhttp_request* req, void* arg)
 		/* Otherwise it's a file; add it to the buffer to get
 		 * sent via sendfile */
 		const char* type = guess_content_type(decoded_path);
-		if ((fd = open(whole_path, O_RDONLY)) < 0) {
-			perror("open");
-			goto err;
+
+		char last_modified[50] = { 0 };
+		char content_length[16] = { 0 };
+		char etag[50] = { 0 };
+		gmt_time_string(last_modified, sizeof(last_modified), &st.st_mtime);
+		itoa(st.st_size, content_length, 10);
+		make_etag_header(etag, sizeof(etag), st.st_mtime, st.st_size);
+		headers = evhttp_request_get_input_headers(req);
+		for (header = headers->tqh_first; header;
+			header = header->next.tqe_next) {
+			if (strcmp(header->key, "If-None-Match") == 0)
+			{
+				if (strcmp(header->value, etag) == 0)
+				{
+					strcpy(etag, header->value);
+					code = HTTP_NOTMODIFIED;
+				}
+				break;
+			}
+		}
+		if (code != HTTP_NOTMODIFIED)
+		{
+			if ((fd = open(whole_path, O_RDONLY)) < 0) {
+				perror("open");
+				goto err;
+			}
+
+			if (fstat(fd, &st) < 0) {
+				/* Make sure the length still matches, now that we
+				 * opened the file :/ */
+				perror("fstat");
+				goto err;
+			}
+			evbuffer_add_file(evb, fd, 0, st.st_size);
 		}
 
-		if (fstat(fd, &st) < 0) {
-			/* Make sure the length still matches, now that we
-			 * opened the file :/ */
-			perror("fstat");
-			goto err;
-		}
 		evhttp_add_header(evhttp_request_get_output_headers(req),
 			"Content-Type", type);
-		evbuffer_add_file(evb, fd, 0, st.st_size);
+		evhttp_add_header(evhttp_request_get_output_headers(req),
+			"Last-Modified", last_modified);
+		evhttp_add_header(evhttp_request_get_output_headers(req),
+			"Etag", etag);
+		evhttp_add_header(evhttp_request_get_output_headers(req),
+			"Content-Length", content_length);
 	}
 
-	evhttp_send_reply(req, 200, "OK", evb);
+	evhttp_send_reply(req, code, "OK", evb);
 	goto done;
 err:
-	evhttp_send_error(req, 404, "Document was not found");
+	evhttp_send_error(req, HTTP_NOTFOUND, "Document was not found");
 	if (fd >= 0)
 		close(fd);
 done:
